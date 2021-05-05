@@ -522,29 +522,93 @@ func (pd *v2PushDescriptor) uploadUsingSession(
 	return desc, nil
 }
 
+// passThroughWriter prevents io.CopyBuffer from utilizing the given
+// io.Writer's ReadFrom method when available.
+type passThroughWriter struct {
+	w io.Writer
+}
+
+func (pt *passThroughWriter) Write(p []byte) (int, error) {
+	return pt.w.Write(p)
+}
+
+// readFullReader ensures that we fill the given output []byte during Read
+// calls as much as possible each time. this is a hacky implementation of
+// io.Reader that is expected to return io.EOF whenever it finishes filling the
+// output []byte even if the inner io.Reader hasn't yet returned io.EOF in
+// order to precisely control the number of bytes being read by the user. it is
+// not safe to use outside of the copyN implementation in this package, even by
+// other functions within the package.
+type readFullReader struct {
+	r io.Reader
+}
+
+// Read reads from the inner io.Reader using io.ReadFull. Because io.ReadFull
+// returns an io.UnexpectedEOF if it can't fully populate the given []byte and
+// that is expected to be a normal situation, we swap it out for io.EOF to
+// indicate that the Read is finished.
+func (b *readFullReader) Read(p []byte) (n int, err error) {
+	n, err = io.ReadFull(b.r, p)
+	if err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			err = io.EOF
+		}
+	}
+	return
+}
+
+// copyN copies n bytes (or until an error) from src to dst.
+// It returns the number of bytes copied and the earliest
+// error encountered while copying.
+// On return, written == n if and only if err == nil.
+//
+// If dst implements the ReaderFrom interface,
+// the copy is implemented using it.
+func copyN(dst io.Writer, src io.Reader, n int64) (written int64, err error) {
+	buf := make([]byte, n)
+
+	// don't allow ReadFrom to be used if the io.Writer is a ReaderFrom
+	dst = &passThroughWriter{w: dst}
+
+	// ensure we always fill up a given Read call's output []byte as much as
+	// possible so that we actually write n bytes at a time
+	src = &readFullReader{r: src}
+
+	written, err = io.CopyBuffer(dst, io.LimitReader(src, n), buf)
+	if written == n {
+		return n, nil
+	}
+	if written < n && err == nil {
+		// src stopped early; must have been EOF.
+		err = io.EOF
+	}
+	return
+}
+
 func (pd *v2PushDescriptor) uploadChunkedUsingSession(
 	ctx context.Context,
 	layerUpload distribution.BlobWriter,
 	reader io.Reader,
-) (int64, error) {
+) (nn int64, err error) {
 	var (
-		nn        int64
-		chunkSize = int64(10 * 1024 * 1024)
+		chunkSize = int64(20 * 1024 * 1024)
+		n         int64
 	)
 
-	for {
-		n, err := io.CopyN(layerUpload, reader, chunkSize)
+	for err == nil {
+		n, err = copyN(layerUpload, reader, chunkSize)
 		nn += n
-		if err != nil {
-			return nn, err
+		if errors.Is(err, io.ErrShortWrite) {
+			continue
 		}
-
-		if n < chunkSize {
-			break
+	}
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nn, nil
 		}
 	}
 
-	return nn, nil
+	return
 }
 
 // layerAlreadyExists checks if the registry already knows about any of the metadata passed in the "metadata"
