@@ -458,6 +458,7 @@ func (pd *v2PushDescriptor) uploadUsingSession(
 	size, _ := pd.layer.Size()
 
 	reader = progress.NewProgressReader(ioutils.NewCancelReadCloser(ctx, contentReader), progressOutput, size, pd.ID(), "Pushing")
+	defer reader.Close()
 
 	switch m := pd.layer.MediaType(); m {
 	case schema2.MediaTypeUncompressedLayer:
@@ -476,10 +477,20 @@ func (pd *v2PushDescriptor) uploadUsingSession(
 	digester := digest.Canonical.Digester()
 	tee := io.TeeReader(reader, digester.Hash())
 
-	nn, err := layerUpload.ReadFrom(tee)
-	reader.Close()
-	if err != nil {
-		return distribution.Descriptor{}, retryOnError(err)
+	var (
+		chunkUploads = true
+		nn           int64
+	)
+	if chunkUploads {
+		nn, err = pd.uploadChunkedUsingSession(ctx, layerUpload, tee)
+		if err != nil {
+			return distribution.Descriptor{}, retryOnError(err)
+		}
+	} else {
+		nn, err = layerUpload.ReadFrom(tee)
+		if err != nil {
+			return distribution.Descriptor{}, retryOnError(err)
+		}
 	}
 
 	pushDigest := digester.Digest()
@@ -509,6 +520,31 @@ func (pd *v2PushDescriptor) uploadUsingSession(
 	pd.pushState.Unlock()
 
 	return desc, nil
+}
+
+func (pd *v2PushDescriptor) uploadChunkedUsingSession(
+	ctx context.Context,
+	layerUpload distribution.BlobWriter,
+	reader io.Reader,
+) (int64, error) {
+	var (
+		nn        int64
+		chunkSize = int64(10 * 1024 * 1024)
+	)
+
+	for {
+		n, err := io.CopyN(layerUpload, reader, chunkSize)
+		nn += n
+		if err != nil {
+			return nn, err
+		}
+
+		if n < chunkSize {
+			break
+		}
+	}
+
+	return nn, nil
 }
 
 // layerAlreadyExists checks if the registry already knows about any of the metadata passed in the "metadata"
