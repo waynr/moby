@@ -73,7 +73,12 @@ func (hbu *httpBlobUpload) Write(p []byte) (n int, err error) {
 	if err != nil {
 		return 0, err
 	}
-	req.Header.Set("Content-Range", fmt.Sprintf("%d-%d", hbu.offset, hbu.offset+int64(len(p)-1)))
+
+	var start, end int64
+	start = hbu.offset
+	end = hbu.offset + int64(len(p)-1)
+
+	req.Header.Set("Content-Range", fmt.Sprintf("%d-%d", start, end))
 	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(p)))
 	req.Header.Set("Content-Type", "application/octet-stream")
 
@@ -91,16 +96,10 @@ func (hbu *httpBlobUpload) Write(p []byte) (n int, err error) {
 	if err != nil {
 		return 0, err
 	}
-	rng := resp.Header.Get("Range")
-	var start, end int
-	if n, err := fmt.Sscanf(rng, "%d-%d", &start, &end); err != nil {
-		return 0, err
-	} else if n != 2 || end < start {
-		return 0, fmt.Errorf("bad range format: %s", rng)
-	}
 
-	return (end - start + 1), nil
+	hbu.offset = end
 
+	return len(p), nil
 }
 
 func (hbu *httpBlobUpload) Size() int64 {
